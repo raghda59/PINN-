@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+# Load the generated combinations data
+df_combinations = pd.read_excel('discharge2.xlsx')
+
+# Print the column names to check for the correct names
+print("Column Names:", df_combinations.columns)
+
+# Extract input features
+X = df_combinations[['T', 't', 'Capacity_Fade']].values
+
+# Normalize input features
+scaler_X = MinMaxScaler()
+X_normalized = scaler_X.fit_transform(X)
+
+# Convert numpy arrays to PyTorch tensors
+X_tensor = torch.tensor(X_normalized, dtype=torch.float32, requires_grad=True)
+
+# Define the PINN model
+class PINNModel(nn.Module):
+    def __init__(self):
+        super(PINNModel, self).__init__()
+        self.dense1 = nn.Linear(3, 100)
+        self.activation1 = nn.Tanh()
+        self.dense2 = nn.Linear(100, 100)
+        self.activation2 = nn.Tanh()
+        self.dense3 = nn.Linear(100, 2)  # 2 outputs: SOC and SOH
+
+    def forward(self, x):
+        x = self.activation1(self.dense1(x))
+        x = self.activation2(self.dense2(x))
+        return self.dense3(x)
+
+# Instantiate the PINN model
+model = PINNModel()
+
+# Define loss function for the PINN
+def loss_fn(X, model):
+    predictions = model(X)
+    SOC_pred, SOH_pred = predictions[:, 0], predictions[:, 1]
+    
+    # Physics equation residuals (replace with your actual physics equations)
+    physics_residuals = torch.stack([
+        SOC_pred - (0.019 * X[:, 2]**0.823 + 0.5195) * (3.258e-9 * X[:, 0]**5.087 + 0.295) * X[:, 1]**0.8,
+        SOH_pred - 0.2 * SOC_pred  # Adjust based on your specific physics equation for SOH
+    ], dim=1)
+    
+    # Data-driven prediction error
+    data_loss = 0.5 * torch.sum((predictions - X[:, :2])**2)
+    
+    # Combined loss
+    total_loss = data_loss + torch.sum(physics_residuals**2)
+    
+    return total_loss, SOC_pred, SOH_pred  # Return SOC and SOH predictions
+
+# Define optimizer
+optimizer = optim.Adam(model.parameters(), lr=0.00001)
+
+# Training the PINN model
+num_epochs = 5000
+
+for epoch in range(num_epochs):
+    loss, SOC_pred, SOH_pred = loss_fn(X_tensor, model)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {loss.item()}')
+
+# Save the trained model
+torch.save(model.state_dict(), 'pinn_model.pth')
+
+
+# Use the trained model to predict SOC and SOH for the entire dataset
+with torch.no_grad():
+    predictions = model(X_tensor).numpy()
+
+# Invert the normalization of the predicted values
+predictions[:, 1] *= 0.2  # Adjust SOH scaling
+
+# Plot the predicted SOC and SOH
+plt.figure(figsize=(12, 6))
+
+plt.subplot(1, 2, 1)
+plt.scatter(df_combinations['Capacity_Fade'], predictions[:, 0], label='Predicted SOC')
+plt.xlabel('Cfade(Capacity_Fade)')
+plt.ylabel('State of Charge (SOC)')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.scatter(df_combinations['Capacity_Fade'], predictions[:, 1], label='Predicted SOH')
+plt.xlabel('Cfade (Capacity_Fade)')
+plt.ylabel('State of Health (SOH)')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
