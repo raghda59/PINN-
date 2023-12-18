@@ -1,0 +1,89 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+
+# Load the data
+df_combinations = pd.read_excel('charging.xlsx')
+
+# Extract input 
+X = df_combinations[['SOC_Initial', 'I_tau', 'W_t']].values
+# W(t) to add noise
+
+# Generate Brownian motion
+W_t = np.random.normal(0, 1, size=X.shape[0])
+
+# Integrate Brownian motion
+X[:, 2] = np.cumsum(W_t) / X.shape[0]
+
+# Normalization
+scaler_X = MinMaxScaler()
+X_normalized = scaler_X.fit_transform(X)
+
+
+X_tensor = torch.tensor(X_normalized, dtype=torch.float32, requires_grad=True)
+
+# Define the PINN model
+class PINNModel(nn.Module):
+    def __init__(self):
+        super(PINNModel, self).__init__()
+        self.dense1 = nn.Linear(3, 300)
+        self.activation1 = nn.Tanh()
+        self.dense2 = nn.Linear(300, 300)
+        self.activation2 = nn.Tanh()
+        self.dense3 = nn.Linear(300, 2)  
+
+    def forward(self, x):
+        x = self.activation1(self.dense1(x))
+        x = self.activation2(self.dense2(x))
+        return self.dense3(x)
+
+# Instantiate the PINN model
+model = PINNModel()
+
+# now enter the eq with adding W(t) 
+def physics_constraint(X):
+    SOC_pred, SOH_pred = model(X).split(1, dim=1)
+    return torch.cat([
+       SOC_pred - X[:, 0] - torch.cumsum(X[:, 1], dim=0) / X.shape[0] + X[:, 2],
+        SOH_pred - (torch.max(SOC_pred) * 0.2) / 0.2
+    ], dim=1)
+
+# Define loss function for the PINN
+def loss_fn(X, model):
+    predictions = model(X)
+    SOC_pred, SOH_pred = predictions.split(1, dim=1)
+
+    # Physics equation residuals
+    physics_residuals = physics_constraint(X)
+
+    # Data-driven prediction error for SoC and SoH
+    data_loss_soc = 0.5 * torch.sum((SOC_pred - X[:, 0])**2)
+    data_loss_soh = 0.5 * torch.sum((SOH_pred - (torch.max(SOC_pred) * 0.2) / 0.2)**2)
+
+    # total loss
+    total_loss = data_loss_soc + data_loss_soh + torch.sum(physics_residuals**2)
+
+    return total_loss, SOC_pred, SOH_pred
+
+
+
+optimizer = optim.Adam(model.parameters(), lr=0.00001)
+
+# Training 
+num_epochs = 4000
+
+for epoch in range(num_epochs):
+    total_loss, SOC_pred, SOH_pred = loss_fn(X_tensor, model)
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {total_loss.item()}')
+
+# Save the trained model
+torch.save(model.state_dict(), 'pinn_charge.pth')
