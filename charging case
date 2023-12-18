@@ -87,3 +87,29 @@ for epoch in range(num_epochs):
 
 # Save the trained model
 torch.save(model.state_dict(), 'pinn_charge.pth')
+
+new_data = np.array([[0.8, 0.1]])  # apply the scenario
+
+
+W_t_new = np.random.normal(0, 1, size=new_data.shape[0])
+new_data = np.column_stack((new_data, np.cumsum(W_t_new) / new_data.shape[0]))
+
+#normalization
+new_data_normalized = scaler_X.transform(new_data)
+
+
+new_data_tensor = torch.tensor(new_data_normalized, dtype=torch.float32)
+
+# now predict 
+with torch.no_grad():
+    predicted_values = model(new_data_tensor)
+
+
+predicted_values_original = predicted_values.numpy()
+
+
+predicted_values_original[:, 1] = predicted_values_original[:, 1] * 0.2
+
+
+print(f'Predicted SOC: {predicted_values_original[0, 0]}')
+print(f'Predicted SOH: {predicted_values_original[0, 1]}')
