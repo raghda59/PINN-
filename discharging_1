@@ -1,0 +1,112 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+
+class PINN(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(PINN, self).__init__()
+        self.fc1 = nn.Linear(input_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, output_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+def physics_loss(outputs, inputs):
+    # Extract individual inputs
+    voltage, efficiency, range, usable_capacity, y = inputs
+
+   
+    if outputs.size(1) == 2:
+        soc, soh = outputs.chunk(2, dim=1)
+    else:
+        soc, soh = outputs, torch.zeros_like(outputs)
+
+  
+    qv_y = usable_capacity * voltage * y
+    denominator = qv_y + 0.2
+
+ 
+    soc_eq = (range * efficiency) / denominator
+
+    # Capacity equation
+    capacity_eq = soc_eq * 0.02
+
+    
+    soh_eq = (capacity_eq / 0.02) 
+
+    # Compute loss
+    loss = 0.5 * ((soc_eq - soc)**2 + (soh_eq - soh)**2)
+
+    return loss
+
+
+inputs = torch.tensor(df[['Voltage', 'Efficiency', 'Range', 'Usable_Capacity', 'Y']].values, dtype=torch.float32)
+
+
+input_size = inputs.shape[1]
+output_size = 2  # Since we are predicting both SOC and SOH
+model = PINN(input_size, output_size)
+
+
+optimizer = optim.Adam(model.parameters(), lr=0.00001)
+
+# Training loop
+num_epochs = 3000
+for epoch in range(num_epochs):
+    # Forward pass
+    predictions = model(inputs)
+
+    
+    soc_eq = (df['Range'] * df['Efficiency']) / (df['Usable_Capacity'] * df['Voltage'] * df['Y'] + 0.2)
+    max_capacity_t = soc_eq * 0.02  # Adjust as needed
+    soh_eq = max_capacity_t / 0.02  # Correct calculation for SOH
+
+    
+    df['SOC'] = soc_eq
+    df['SOH'] = soh_eq
+
+    # Convert 'SOC' and 'SOH' to PyTorch tensors
+    target_outputs = torch.tensor(df[['SOC', 'SOH']].values, dtype=torch.float32)
+    
+    loss = physics_loss(predictions, [inputs[:, i] for i in range(inputs.shape[1])])
+
+   
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+   
+    if epoch % 50 == 0:
+        print(f'Epoch {epoch}/{num_epochs}, Loss: {loss.item()}')
+
+
+soc_predictions = predictions[:, 0].detach().numpy()
+soh_predictions = predictions[:, 1].detach().numpy()
+
+
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.scatter(df['Usable_Capacity'], soc_predictions, label='Predicted')
+plt.scatter(df['Usable_Capacity'], df['SOC'], label='True')
+plt.xlabel('Usable Capacity')
+plt.ylabel('SOC')
+plt.legend()
+plt.title('SOC Prediction vs True SOC')
+
+plt.subplot(1, 2, 2)
+plt.scatter(df['Usable_Capacity'], soh_predictions, label='Predicted')
+plt.scatter(df['Usable_Capacity'], df['SOH'], label='True')
+plt.xlabel('Usable Capacity')
+plt.ylabel('SOH')
+plt.legend()
+plt.title('SOH Prediction vs True SOH')
+
+plt.tight_layout()
+plt.show()
