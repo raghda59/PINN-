@@ -1,0 +1,265 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+parameters = pd.read_excel('new_parameters_1227_meeting.xlsx')  # to call my parameters
+
+X = parameters[
+    [
+        'SOC_initial_charging', 'I_t_charging', 'time_charging', 'radial', 'C_s', 'W_t_1',
+        'range_Mdischarging', 'eta_Mdischarging', 'Q_usable', 'v', 'I_Mdischarging', 'v_ind',
+        'W_t_2', 'SOC_stored', 'Temp_standby', 'Time_standby', 'X0', 'X100', 'W_t_3'
+    ]
+].values
+
+scaler_X = MinMaxScaler()
+X_normalized = scaler_X.fit_transform(X)
+
+X_tensor = torch.tensor(X_normalized, dtype=torch.float32, requires_grad=True)
+
+
+class PINNModel(nn.Module):
+    def __init__(self):
+        super(PINNModel, self).__init__()
+        self.dense1 = nn.Linear(19, 500)
+        self.activation1 = nn.Tanh()
+        self.dense2 = nn.Linear(500, 500)
+        self.activation2 = nn.Tanh()
+        self.dense3 = nn.Linear(500, 500)
+        self.activation3 = nn.ReLU()
+        self.dense4 = nn.Linear(500, 2)
+
+    def forward(self, x):
+        x = self.activation1(self.dense1(x))
+        x = self.activation2(self.dense2(x))
+        x = self.activation3(self.dense3(x))
+        return self.dense4(x)
+
+
+PINN_for_charging_by_start_scenario_1 = PINNModel()
+model_parameters = list(PINN_for_charging_by_start_scenario_1.parameters())
+
+
+
+# constraint for charging
+def I_tau(I_t_charging):
+    I_tau = I_t_charging / 16
+    return I_tau
+
+        
+def calculate_soc_1_charging(I_tau_value, time_charging, SOC_initial_charging, W_t_1):
+    I_tau_value = I_tau(I_t_charging)
+    integral_white_noise = np.cumsum(X_normalized[:, 5])
+    soc_1 = SOC_initial_charging + torch.trapz((I_tau_value / 60), time_charging) + torch.tensor(integral_white_noise,
+                                                                                               dtype=torch.float32)
+    return soc_1
+
+
+def calculate_c_avg(radial, C_s):
+    dx = 1.5e-6  # limit / inp #
+
+    #integrating along the 0-th dimension (dim=0)
+    c_avg = (3 / (3.3 * 10**-6)) * torch.trapz(((radial**2) * C_s), dx=dx, dim=0)
+    return c_avg.view(1)  
+
+
+
+def calculate_soc_loss(c_avg):
+    dx = 1.5e-6  # Adjust the step size according to your data
+    #integrating along the 0-th dimension (dim=0)
+    soc_loss = torch.trapz((c_avg / (36129.55 * 55.5e-6)), dx=dx, dim=0)
+    return soc_loss.unsqueeze(0)   # to have the same size as c_avg
+
+
+W_t_1 = torch.tensor(X[:, 5], dtype=torch.float32, requires_grad=True)
+I_t_charging = torch.tensor(X[:, 1], dtype=torch.float32, requires_grad=True)
+
+optimizer = optim.Adam(model_parameters, lr=0.00001)
+soc_1_values = []  # to store soc_1 values
+time_charging_values = []  # to store time_charging values
+for epoch in range(1000):
+    I_tau_value = I_tau(I_t_charging)
+    radial = torch.tensor(X[:, 3], dtype=torch.float32, requires_grad=True)
+    C_s = torch.tensor(X[:, 4], dtype=torch.float32, requires_grad=True)
+    c_avg = calculate_c_avg(radial, C_s)
+    time_charging = torch.tensor(X[:, 2], dtype=torch.float32, requires_grad=True)
+    SOC_initial_charging = torch.tensor(X[:, 0], dtype=torch.float32, requires_grad=True)
+    W_t_1 = torch.tensor(X[:, 5], dtype=torch.float32, requires_grad=True)
+    soc_1 = calculate_soc_1_charging(I_tau_value, time_charging, SOC_initial_charging, W_t_1)
+    soc_loss = calculate_soc_loss(c_avg)
+    
+def loss(soc_1, soc_loss):
+    return F.mse_loss(soc_1, soc_loss.expand_as(soc_1), reduction='mean') 
+    loss_value_c = loss(soc_1, soc_loss)
+
+    optimizer.zero_grad()
+    loss_value_c.backward(retain_graph=True)
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {loss_value_c.item()}')
+        print(f'soc_1: {soc_1.detach().numpy()}')
+        soc_1_values.append(soc_1.detach().numpy())  # Update the values here
+        time_charging_values.append(time_charging.detach().numpy())
+        
+        
+        
+plt.figure(figsize=(10, 6))
+plt.plot(time_charging_values, soc_1_values, label='SOC_1')
+plt.xlabel('Time Charging')
+plt.ylabel('SOC_1')
+plt.title('SOC_1 vs Time Charging')
+plt.legend()
+plt.show()
+
+# now the moving case after the car being charged
+
+# constraints:
+def calculate_P(I_Mdischarging, v):
+    P = I_Mdischarging * v
+    return P
+
+
+def calculate_x_n(v, v_ind):
+    x_n = v / v_ind
+    return x_n
+
+
+def calculate_I_ind(v_ind, P, x_n, Y):
+    I_ind = P / (Y * x_n * v_ind)
+    return I_ind
+
+
+def calculate_Y(I_Mdischarging, I_ind):
+    Y = I_Mdischarging / I_ind
+    return Y
+
+
+def calculate_SOC_M(Y, v, range_Mdischarging, eta_Mdischarging, Q_usable, W_t_2):
+    integral_white_noise_M = np.cumsum(X_normalized[:, 12])
+    SOC_M = ((eta_Mdischarging * range_Mdischarging) / (Q_usable * v * Y)) + 0.2 + torch.tensor(integral_white_noise_M,
+                                                                                                dtype=torch.float32)
+    return SOC_M
+
+
+def calculate_c(SOC_M, Q_usable):
+    c = (SOC_M - 0.2) * Q_usable
+    return c
+
+
+def calculate_SOC_loss_m(c, Q_usable):
+    SOC_loss_m = (c / Q_usable) + 0.2
+    return SOC_loss_m
+
+v = torch.tensor(X[:, 9], dtype=torch.float32, requires_grad=True)
+v_ind = torch.tensor(X[:, 11], dtype=torch.float32, requires_grad=True)
+I_Mdischarging = torch.tensor(X[:, 10], dtype=torch.float32, requires_grad=True)
+I_ind = torch.ones_like(v_ind, dtype=torch.float32, requires_grad=True)
+
+Y = calculate_Y(I_Mdischarging, I_ind)
+P = calculate_P(I_Mdischarging, v) 
+x_n = calculate_x_n(v, v_ind)
+I_ind = calculate_I_ind(v_ind, P, x_n, Y)
+
+range_Mdischarging = torch.tensor(X[:, 6], dtype=torch.float32, requires_grad=True)
+eta_Mdischarging = torch.tensor(X[:, 7], dtype=torch.float32, requires_grad=True)
+Q_usable = torch.tensor(X[:, 8], dtype=torch.float32, requires_grad=True)
+W_t_2 = torch.tensor(X[:, 12], dtype=torch.float32, requires_grad=True)
+
+optimizer = optim.Adam(model_parameters, lr=0.00001)
+SOC_M_values = []  # to store SOC_M values
+range_Mdischarging_values = []
+for epoch in range(1000):
+    Y_value = calculate_Y(I_Mdischarging, I_ind)
+    SOC_M = calculate_SOC_M(Y_value, v, range_Mdischarging, eta_Mdischarging, Q_usable, W_t_2)
+    c = calculate_c(SOC_M, Q_usable)
+    SOC_loss_m = calculate_SOC_loss_m(c, Q_usable)
+
+    loss_value_m = loss(SOC_M, SOC_loss_m)
+    optimizer.zero_grad()
+    loss_value_m.backward(retain_graph=True)
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {loss_value_m.item()}')
+        print(f'SOC_M: {SOC_M.detach().numpy()}')
+        SOC_M_values.append(SOC_M.detach().numpy())
+        range_Mdischarging_values.append(range_Mdischarging.detach().numpy())
+plt.figure(figsize=(10, 6))
+plt.plot(range_Mdischarging_values, SOC_M_values, label='SOC_M')
+plt.xlabel('Range Mdischarging')
+plt.ylabel('SOC_M')
+plt.title('SOC_M vs Range Mdischarging')
+plt.legend()
+plt.show()
+
+
+
+# now the car to be charged:
+def calculate_soc_3_charging(I_tau_value, time_charging, SOC_initial_charging, W_t_1):
+    integral_white_noise_charge_2 = np.cumsum(X_normalized[:, 5])
+    soc_3 = SOC_M + torch.trapz((I_tau_value / 60), time_charging) + torch.tensor(integral_white_noise_charge_2,
+                                                                                dtype=torch.float32)
+    return soc_3
+
+
+I_tau = I_tau(I_t_charging)
+optimizer = optim.Adam(model_parameters, lr=0.00001)
+soc_3_values = []  # to store soc_3 values
+I_tau_values = []  # to store I_tau_values
+for epoch in range(1000):
+    soc_3 = calculate_soc_3_charging(I_tau, time_charging, SOC_initial_charging, W_t_1)
+    soc_loss = calculate_soc_loss(c_avg)
+
+    loss_value_c_2 = loss(soc_3, soc_loss)
+    optimizer.zero_grad()
+    loss_value_c_2.backward(retain_graph=True)
+    optimizer.step()
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {loss_value_c_2.item()}')
+        print(f'soc_3: {soc_3.detach().numpy()}')
+        soc_3 = calculate_soc_3_charging(I_tau, time_charging, SOC_initial_charging, W_t_1)
+        soc_loss = calculate_soc_loss(c_avg)
+
+plt.figure(figsize=(10, 6))
+plt.plot(I_tau_values, soc_3_values, label='SOC_3')
+plt.xlabel('I_tau_value')
+plt.ylabel('SOC_3')
+plt.title('SOC_3 vs I_tau_value')
+plt.legend()
+plt.show()
+
+# all loss
+optimizer = optim.Adam(model_parameters, lr=0.00001)
+for epoch in range(1000):
+    loss_value_c = loss(soc_1, soc_loss)
+    loss_value_m = loss(SOC_M, SOC_loss_m)
+    loss_value_c_2 = loss(soc_3, soc_loss)
+
+    total_loss = loss(soc_1, soc_loss) + loss(SOC_M, SOC_loss_m) + loss(soc_3, soc_loss)
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+
+    if epoch % 100 == 0:
+        print(f'Epoch {epoch}, Loss: {total_loss.item()}')
+
+def calculate_c1(soc_3):
+    c1 = soc_3 * 60
+    return c1
+
+
+def calculate_SOH(c1):
+    SOH = torch.max(c1) / 60
+    return SOH.item() 
+    
+c1 = calculate_c1(soc_3)
+soh = calculate_SOH(c1)
+print(f'Final State of Health (SOH): {soh}')
